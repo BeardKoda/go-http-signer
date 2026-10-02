@@ -39,6 +39,9 @@ func TestSigningVerificationRoundTrip(t *testing.T) {
 	}
 
 	v := verifier.New(keys.NewStaticKeyStore(map[string]crypto.PublicKey{"k1": pub}))
+	v.Now = func() time.Time {
+		return time.Unix(1_700_000_030, 0)
+	}
 	ok, err := v.Verify(req)
 	if err != nil {
 		t.Fatal(err)
