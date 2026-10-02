@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"strings"
@@ -16,14 +17,25 @@ import (
 	"time"
 )
 
+// maxJWKSBytes caps the size of a JWKS response body.
+const maxJWKSBytes = 1 << 20
+
 type JWKSKeyStore struct {
 	URL    string
 	TTL    time.Duration
 	Client *http.Client
+	// MinRefreshInterval is the minimum time between fetches. It stops
+	// requests carrying unknown key IDs from hammering the JWKS endpoint.
+	// Zero means 30 seconds.
+	MinRefreshInterval time.Duration
 
 	mu        sync.RWMutex
 	keys      map[string]crypto.PublicKey
 	expiresAt time.Time
+
+	refreshMu   sync.Mutex
+	lastAttempt time.Time
+	lastErr     error
 }
 
 func NewJWKSKeyStore(url string, ttl time.Duration) *JWKSKeyStore {
@@ -39,25 +51,43 @@ func NewJWKSKeyStore(url string, ttl time.Duration) *JWKSKeyStore {
 
 func (s *JWKSKeyStore) GetKey(keyID string) (crypto.PublicKey, error) {
 	// Fast path: cached key exists and cache is still valid.
-	s.mu.RLock()
-	key, ok := s.keys[keyID]
-	expired := time.Now().After(s.expiresAt)
-	s.mu.RUnlock()
+	if key, ok, expired := s.cached(keyID); ok && !expired {
+		return key, nil
+	}
+
+	// One refresh at a time; callers that waited re-check the cache first.
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	key, ok, expired := s.cached(keyID)
 	if ok && !expired {
 		return key, nil
 	}
 
-	if err := s.refresh(context.Background()); err != nil {
-		return nil, err
+	minInterval := s.MinRefreshInterval
+	if minInterval <= 0 {
+		minInterval = 30 * time.Second
+	}
+	if time.Since(s.lastAttempt) >= minInterval {
+		s.lastAttempt = time.Now()
+		s.lastErr = s.refresh(context.Background())
+		key, ok, _ = s.cached(keyID)
 	}
 
-	s.mu.RLock()
-	key, ok = s.keys[keyID]
-	s.mu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, keyID)
+	// On a failed refresh, keep serving the last good key set.
+	if ok {
+		return key, nil
 	}
-	return key, nil
+	if s.lastErr != nil {
+		return nil, s.lastErr
+	}
+	return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, keyID)
+}
+
+func (s *JWKSKeyStore) cached(keyID string) (key crypto.PublicKey, ok, expired bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key, ok = s.keys[keyID]
+	return key, ok, time.Now().After(s.expiresAt)
 }
 
 func (s *JWKSKeyStore) refresh(ctx context.Context) error {
@@ -68,7 +98,7 @@ func (s *JWKSKeyStore) refresh(ctx context.Context) error {
 
 	client := s.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = &http.Client{Timeout: 10 * time.Second}
 	}
 
 	resp, err := client.Do(req)
@@ -82,7 +112,7 @@ func (s *JWKSKeyStore) refresh(ctx context.Context) error {
 	}
 
 	var set jwksSet
-	if err := json.NewDecoder(resp.Body).Decode(&set); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxJWKSBytes)).Decode(&set); err != nil {
 		return fmt.Errorf("decode jwks: %w", err)
 	}
 
@@ -126,6 +156,9 @@ func parseJWK(k jwk) (crypto.PublicKey, error) {
 		eBytes, err := base64.RawURLEncoding.DecodeString(k.E)
 		if err != nil {
 			return nil, fmt.Errorf("decode rsa e: %w", err)
+		}
+		if len(eBytes) == 0 || len(eBytes) > 4 {
+			return nil, errors.New("invalid rsa exponent")
 		}
 		e := 0
 		for _, b := range eBytes {

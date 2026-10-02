@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
+	"slices"
 	"strings"
 	"time"
 
@@ -20,11 +20,24 @@ type KeyStore interface {
 	GetKey(keyID string) (crypto.PublicKey, error)
 }
 
+// DefaultMaxAge is how long after its created time a signature is accepted
+// when Verifier.MaxAge is zero.
+const DefaultMaxAge = 5 * time.Minute
+
 type Verifier struct {
-	KeyStore          KeyStore
-	AllowedClockSkew  time.Duration
-	ReplayCache       ReplayCache
-	DefaultReplayTTL  time.Duration
+	KeyStore         KeyStore
+	AllowedClockSkew time.Duration
+	// MaxAge bounds how old a signature may be, measured from its created
+	// parameter. Zero means DefaultMaxAge.
+	MaxAge time.Duration
+	// AllowMissingCreated accepts signatures without a created parameter.
+	// Such signatures have no age limit, so only enable this together with
+	// an expires-based policy you control.
+	AllowMissingCreated bool
+	ReplayCache         ReplayCache
+	// DisableBodyDigest skips the content-digest check. When it is false,
+	// any request with a body must carry a matching content-digest header
+	// that is listed among the signed components.
 	DisableBodyDigest bool
 	Now               func() time.Time
 }
@@ -33,7 +46,7 @@ func New(keyStore keys.KeyStore) *Verifier {
 	return &Verifier{
 		KeyStore:         keyStore,
 		AllowedClockSkew: 30 * time.Second,
-		DefaultReplayTTL: 5 * time.Minute,
+		MaxAge:           DefaultMaxAge,
 	}
 }
 
@@ -65,15 +78,15 @@ func (v *Verifier) Verify(req *http.Request) (bool, error) {
 		nowFn = time.Now
 	}
 	now := nowFn()
-	if err := checkTimestamps(input, now, v.AllowedClockSkew); err != nil {
+	if err := v.checkTimestamps(input, now); err != nil {
 		return false, err
 	}
 
-	if err := v.verifyBodyDigest(req); err != nil {
+	if err := v.verifyBodyDigest(req, input.Components); err != nil {
 		return false, err
 	}
 
-	base, err := canonical.BuildSignatureBase(req, input.Components)
+	base, err := canonical.BuildSignatureBase(req, input.Components, input.Params)
 	if err != nil {
 		return false, err
 	}
@@ -91,50 +104,68 @@ func (v *Verifier) Verify(req *http.Request) (bool, error) {
 	}
 
 	if v.ReplayCache != nil {
-		replayID := signatureReplayID(signatureHeader, input.Created)
-		if v.ReplayCache.Seen(replayID) {
+		// The signature bytes cover every parameter, so they identify the
+		// signed message uniquely.
+		if v.ReplayCache.SeenOrStore(string(sig), v.replayTTL(input, now)) {
 			return false, fmt.Errorf("replay detected")
 		}
-		v.ReplayCache.Store(replayID, v.replayTTL(input, now))
 	}
 
 	return true, nil
 }
 
-func checkTimestamps(input signatureInput, now time.Time, allowedSkew time.Duration) error {
-	if input.Created != 0 {
+func (v *Verifier) maxAge() time.Duration {
+	if v.MaxAge > 0 {
+		return v.MaxAge
+	}
+	return DefaultMaxAge
+}
+
+func (v *Verifier) checkTimestamps(input signatureInput, now time.Time) error {
+	skew := v.AllowedClockSkew
+	if input.Created == 0 {
+		if !v.AllowMissingCreated {
+			return fmt.Errorf("signature has no created parameter")
+		}
+	} else {
 		created := time.Unix(input.Created, 0)
-		if created.After(now.Add(allowedSkew)) {
+		if created.After(now.Add(skew)) {
 			return fmt.Errorf("signature created time is in the future")
+		}
+		if now.After(created.Add(v.maxAge() + skew)) {
+			return fmt.Errorf("signature too old")
 		}
 	}
 	if input.Expires != 0 {
 		expires := time.Unix(input.Expires, 0)
-		if now.After(expires.Add(allowedSkew)) {
+		if now.After(expires.Add(skew)) {
 			return fmt.Errorf("signature expired")
 		}
 	}
 	return nil
 }
 
-func signatureReplayID(signatureHeader string, created int64) string {
-	return signatureHeader + "|" + strconv.FormatInt(created, 10)
-}
-
+// replayTTL keeps a signature in the replay cache for as long as
+// checkTimestamps would still accept it.
 func (v *Verifier) replayTTL(input signatureInput, now time.Time) time.Duration {
-	if input.Expires > 0 {
-		d := time.Until(time.Unix(input.Expires, 0))
-		if d > 0 {
-			return d
+	var until time.Time
+	if input.Created != 0 {
+		until = time.Unix(input.Created, 0).Add(v.maxAge())
+	}
+	if input.Expires != 0 {
+		if exp := time.Unix(input.Expires, 0); until.IsZero() || exp.Before(until) {
+			until = exp
 		}
 	}
-	if v.DefaultReplayTTL > 0 {
-		return v.DefaultReplayTTL
+	if until.IsZero() {
+		// No created and no expires: the signature never ages out, so the
+		// best the cache can do is remember it for a long time.
+		return 24 * time.Hour
 	}
-	return 5 * time.Minute
+	return until.Add(v.AllowedClockSkew).Sub(now) + time.Second
 }
 
-func (v *Verifier) verifyBodyDigest(req *http.Request) error {
+func (v *Verifier) verifyBodyDigest(req *http.Request, components []string) error {
 	if v.DisableBodyDigest {
 		return nil
 	}
@@ -149,8 +180,14 @@ func (v *Verifier) verifyBodyDigest(req *http.Request) error {
 	req.Body = io.NopCloser(bytes.NewReader(body))
 
 	got := strings.TrimSpace(req.Header.Get("content-digest"))
-	if got == "" {
+	if len(body) == 0 && got == "" {
 		return nil
+	}
+	if got == "" {
+		return fmt.Errorf("request has a body but no content-digest header")
+	}
+	if !slices.Contains(components, "content-digest") {
+		return fmt.Errorf("content-digest is not covered by the signature")
 	}
 	want := root.ComputeContentDigest(body)
 	if got != want {

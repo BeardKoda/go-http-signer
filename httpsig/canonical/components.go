@@ -9,7 +9,8 @@ import (
 func resolveComponentValue(req *http.Request, component string) (string, error) {
 	switch component {
 	case "@method":
-		return strings.ToLower(strings.TrimSpace(req.Method)), nil
+		// RFC 9421 §2.2.1: the method is case-sensitive and used verbatim.
+		return strings.TrimSpace(req.Method), nil
 	case "@path":
 		if req.URL == nil {
 			return "/", nil
